@@ -7,10 +7,26 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import triton
-import triton.language as tl
+import sys
+import os
 
-# 定义数据集类，用于加载和处理数据
+# 添加triton的安装路径到Python路径
+triton_path = "/root/miniconda3/envs/py12/lib/python3.12/site-packages"
+if triton_path not in sys.path:
+    sys.path.append(triton_path)
+
+# 导入triton
+try:
+    import triton
+    import triton.language as tl
+    from triton import attention  # 导入Triton的attention函数
+except ImportError as e:
+    print(f"Error importing triton: {e}")
+    print("Current Python path:")
+    print('\n'.join(sys.path))
+    raise
+
+# 定义数据集类
 class JXdataset(Dataset):
     def __init__(self, path):
         # 读取CSV文件并转换为张量
@@ -22,167 +38,222 @@ class JXdataset(Dataset):
     def __getitem__(self, index):
         # 返回指定索引的特征和目标值
         return self.value[index], self.target[index]
-    
+
     def __len__(self):
         # 返回数据集大小
         return len(self.value)
 
-# 设置批处理大小和数据加载器
-batch_size = 64
-train_dataset = JXdataset("./jixie_train_data.csv")
-train_loader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)
-test_dataset = JXdataset("./jixie_test_data.csv")
-test_loader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
-
-# 设置设备和损失函数
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-loss_func = nn.MSELoss()
-
-# Flash Attention实现
-class FlashAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        # 设置模型参数
-        self.embed_dim = embed_dim  # 嵌入维度
-        self.num_heads = num_heads  # 注意力头数
-        self.head_dim = embed_dim // num_heads  # 每个头的维度
-        
-        # 确保参数满足要求
-        assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
-        assert self.head_dim in {16, 32, 64, 128}, "head_dim必须是16、32、64或128之一"
-        
-        # 设置缩放因子
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-        
-    def forward(self, q, k, v):
-        # 获取输入维度
-        batch_size, seq_len, _ = q.shape
-        
-        # 重塑为多头格式 [batch_size, num_heads, seq_len, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # 计算缩放点积注意力
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # 计算注意力分数
-        attn = F.softmax(attn, dim=-1)  # 应用softmax
-        output = attn @ v  # 计算加权和
-        
-        # 重塑回原始形状 [batch_size, seq_len, embed_dim]
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        return output
-
-# 创建带有Flash Attention的回归模型
+# 创建回归模型
 class RegressionModel(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64, n_head=4):
+    def __init__(self, input_dim=4, hidden_dim=256, n_head=8):
         super().__init__()
-        # 确保参数满足要求
+        # 确保隐藏层维度能被注意力头数整除
         assert hidden_dim % n_head == 0, "hidden_dim必须能被n_head整除"
         head_dim = hidden_dim // n_head
-        assert head_dim in {16, 32, 64, 128}, "head_dim必须是16、32、64或128之一"
+        # 确保每个头的维度是16的倍数且大于等于32
+        assert head_dim % 16 == 0 and head_dim >= 32, "head_dim必须是16的倍数且大于等于32"
         
-        # 定义模型层
-        self.input_embedding = nn.Linear(input_dim, hidden_dim)  # 输入嵌入层
-        self.flash_attention = FlashAttention(hidden_dim, n_head)  # Flash Attention层
-        self.output_layer = nn.Linear(hidden_dim, 1)  # 输出层
+        # 输入嵌入层：将输入特征映射到隐藏空间
+        self.input_embedding = nn.Linear(input_dim, hidden_dim)
+        
+        # 输出层：将隐藏层特征映射到预测值
+        self.output_layer = nn.Linear(hidden_dim, 1)
+        
+        # 保存模型配置
+        self.hidden_dim = hidden_dim
+        self.n_head = n_head
+        self.head_dim = head_dim
         
     def forward(self, x):
         # x: [batch_size, input_features]
-        x = x.unsqueeze(1)  # [batch_size, 1, input_features]
-        x = self.input_embedding(x)  # [batch_size, 1, hidden_dim]
+        batch_size = x.shape[0]
         
-        # 使用相同的张量进行自注意力计算
-        x = self.flash_attention(x, x, x)  # [batch_size, 1, hidden_dim]
+        # 将输入扩展为固定长度的序列（16的倍数，满足Triton要求）
+        seq_len = 16  # 使用16作为序列长度
+        x = x.unsqueeze(1).expand(-1, seq_len, -1)  # [batch_size, seq_len, input_features]
+        x = x.contiguous()  # 确保输入张量在内存中是连续的
         
-        x = self.output_layer(x)  # [batch_size, 1, 1]
-        x = x.squeeze(-1).squeeze(-1)  # [batch_size]
+        # 通过嵌入层映射到隐藏空间
+        x = self.input_embedding(x)  # [batch_size, seq_len, hidden_dim]
+        x = x.contiguous()  # 确保嵌入输出是连续的
+        
+        # 转换为float16以提高计算效率
+        x = x.to(torch.float16)
+        
+        # 重塑为多头格式 [batch_size, n_head, seq_len, head_dim]
+        x = x.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        x = x.contiguous()  # 确保多头格式是连续的
+        
+        # 使用Triton Flash Attention进行自注意力计算
+        # 对于自注意力，q=k=v=x
+        sm_scale = 1.0 / math.sqrt(self.head_dim)  # 缩放因子
+        x = attention(x, x, x, True, sm_scale)  # 调用Triton的attention实现
+        
+        # 重塑回原始形状
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        
+        # 转换回float32以进行后续计算
+        x = x.to(torch.float32)
+        
+        # 只取第一个时间步的输出
+        x = x[:, 0, :]
+        x = x.contiguous()  # 确保最终输出是连续的
+        
+        # 通过输出层得到预测值
+        x = self.output_layer(x)  # [batch_size, 1]
+        x = x.squeeze(-1)  # [batch_size]
         return x
 
-# 训练循环函数
-def train_loop(model, train_loader, optimizer, loss_fn, device, epoch):
-    model.train()  # 设置为训练模式
-    total_loss = 0.0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Training")
-    
-    # 遍历训练数据
-    for batch_idx, (data, target) in enumerate(pbar):
-        data, target = data.to(device), target.to(device)
-        optimizer.zero_grad()  # 清除梯度
-        output = model(data)  # 前向传播
-        loss = loss_fn(output, target)  # 计算损失
-        loss.backward()  # 反向传播
-        optimizer.step()  # 更新参数
-        total_loss += loss.item()
-        pbar.set_postfix({"loss": total_loss / (batch_idx + 1)})
-    
-    # 计算平均损失
-    avg_loss = total_loss / len(train_loader)
-    print(f"训练损失: {avg_loss:.6f}")
-    return avg_loss
-
-# 测试循环函数
-def test_loop(model, test_loader, loss_fn, device):
-    model.eval()  # 设置为评估模式
-    test_loss = 0.0
-    
-    # 在测试集上进行评估
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            loss = loss_fn(output, target)
-            test_loss += loss.item()
-    
-    # 计算平均测试损失
-    avg_loss = test_loss / len(test_loader)
-    print(f"测试损失: {avg_loss:.6f}")
-    return avg_loss
-
-# 主函数
-def main():
+# 训练模型函数
+def train_model(model, train_loader, test_loader, num_epochs=100, learning_rate=0.001, patience=10):
+    # 设置设备（GPU或CPU）
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     
-    # 设置超参数
-    input_dim = 4  # 输入特征维度
-    hidden_dim = 64  # 隐藏层维度
-    n_head = 4  # 注意力头数
-    learning_rate = 1e-3  # 学习率
-    weight_decay = 1e-4  # 权重衰减
-    num_epochs = 100  # 训练轮数
+    # 定义优化器和学习率调度器
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    criterion = nn.MSELoss()
     
-    # 创建模型
-    model = RegressionModel(input_dim, hidden_dim, n_head).to(device)
-    
-    # 定义优化器
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    
-    # 记录训练历史
+    # 用于早停的变量
+    best_val_loss = float('inf')
+    patience_counter = 0
     train_losses = []
-    test_losses = []
+    val_losses = []
     
     # 训练循环
     for epoch in range(num_epochs):
-        train_loss = train_loop(model, train_loader, optimizer, loss_func, device, epoch)
-        test_loss = test_loop(model, test_loader, loss_func, device)
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        for inputs, targets in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
         
-        train_losses.append(train_loss)
-        test_losses.append(test_loss)
+        # 计算平均训练损失
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+        
+        # 计算平均验证损失
+        avg_val_loss = val_loss / len(test_loader)
+        val_losses.append(avg_val_loss)
+        
+        # 更新学习率
+        scheduler.step(avg_val_loss)
+        
+        # 打印训练信息
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+        
+        # 早停检查
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # 保存最佳模型
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'Early stopping triggered after {epoch+1} epochs')
+                break
     
-    # 绘制训练和测试损失曲线
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='training loss')
-    plt.plot(test_losses, label='test loss')
-    plt.xlabel('epoch')
-    plt.ylabel('loss (MSE)')
-    plt.title('test vs train loss')
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_model.pth'))
+    
+    # 绘制损失曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
     plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_plot_test.png')
+    plt.savefig('loss_curve.png')
+    plt.close()
     
-    # 保存模型
-    torch.save(model.state_dict(), 'regression_model.pth')
+    return model
+
+# 评估模型函数
+def evaluate_model(model, test_loader):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    criterion = nn.MSELoss()
     
-    print("训练完成!")
+    total_loss = 0.0
+    predictions = []
+    actuals = []
+    
+    # 在测试集上进行评估
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+            
+            predictions.extend(outputs.cpu().numpy())
+            actuals.extend(targets.cpu().numpy())
+    
+    # 计算平均损失
+    avg_loss = total_loss / len(test_loader)
+    predictions = np.array(predictions)
+    actuals = np.array(actuals)
+    
+    # 计算R2分数
+    ss_res = np.sum((actuals - predictions) ** 2)
+    ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
+    r2 = 1 - (ss_res / ss_tot)
+    
+    print(f'Test Loss: {avg_loss:.4f}')
+    print(f'R2 Score: {r2:.4f}')
+    
+    # 绘制预测值vs实际值散点图
+    plt.figure(figsize=(10, 5))
+    plt.scatter(actuals, predictions, alpha=0.5)
+    plt.plot([actuals.min(), actuals.max()], [actuals.min(), actuals.max()], 'r--')
+    plt.xlabel('Actual Values')
+    plt.ylabel('Predicted Values')
+    plt.title('Actual vs Predicted Values')
+    plt.savefig('predictions.png')
+    plt.close()
+    
+    return avg_loss, r2
 
 if __name__ == "__main__":
-    main()
+    # 设置随机种子以确保可重复性
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 加载数据
+    batch_size = 64
+    train_dataset = JXdataset("./jixie_train_data.csv")
+    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)
+    test_dataset = JXdataset("./jixie_test_data.csv")
+    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
+    
+    # 创建模型
+    model = RegressionModel(input_dim=4, hidden_dim=256, n_head=8)
+    
+    # 训练模型
+    trained_model = train_model(model, train_loader, test_loader)
+    
+    # 评估模型
+    test_loss, r2_score = evaluate_model(trained_model, test_loader) 
