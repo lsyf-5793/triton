@@ -63,22 +63,89 @@ class JXdataset(Dataset):
 
 # 创建回归模型
 class RegressionModel(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=128):
+    def __init__(self, input_dim=4, hidden_dim=256, n_head=8):
         super().__init__()
+        # 确保隐藏层维度能被注意力头数整除
+        assert hidden_dim % n_head == 0, "hidden_dim必须能被n_head整除"
+        head_dim = hidden_dim // n_head
+        # 确保每个头的维度是16的倍数且大于等于32
+        assert head_dim % 16 == 0 and head_dim >= 32, "head_dim必须是16的倍数且大于等于32"
         
-        # 定义网络层
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 1)
-        )
+        # 输入嵌入层
+        self.input_embedding = nn.Linear(input_dim, hidden_dim)
+        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        # Dropout
+        self.dropout = nn.Dropout(0.1)
+        
+        # 输出层
+        self.output_layer = nn.Linear(hidden_dim, 1)
+        
+        # 保存配置
+        self.hidden_dim = hidden_dim
+        self.n_head = n_head
+        self.head_dim = head_dim
+        
+        # 设置序列长度为256（128的倍数，满足Triton的要求）
+        self.seq_len = 256
         
     def forward(self, x):
-        return self.network(x).squeeze(-1)
+        # 确保输入是连续的
+        x = x.contiguous()
+        batch_size = x.shape[0]
+        
+        # 将输入扩展为固定长度的序列（256，满足Triton要求）
+        x = x.unsqueeze(1).expand(-1, self.seq_len, -1)  # [batch_size, seq_len, input_features]
+        x = x.contiguous()  # 确保输入张量在内存中是连续的
+        
+        # 通过嵌入层
+        x = self.input_embedding(x)  # [batch_size, seq_len, hidden_dim]
+        x = self.norm1(x)
+        x = x.contiguous()  # 确保嵌入输出是连续的
+        
+        # 转换为float16以提高计算效率
+        x = x.to(torch.float16)
+        
+        # 重塑为多头格式 [batch_size, n_head, seq_len, head_dim]
+        x = x.view(batch_size, self.seq_len, self.n_head, self.head_dim)
+        x = x.transpose(1, 2)  # [batch_size, n_head, seq_len, head_dim]
+        x = x.contiguous()  # 确保多头格式是连续的
+        
+        # 使用Triton Flash Attention进行自注意力计算
+        # 对于自注意力，q=k=v=x
+        sm_scale = 1.0 / math.sqrt(self.head_dim)  # 缩放因子
+        
+        # 确保所有输入张量都是连续的
+        q = x.contiguous()
+        k = x.contiguous()
+        v = x.contiguous()
+        
+        # 调用Triton的attention实现
+        x = attention(q, k, v, True, sm_scale)
+        x = self.dropout(x)
+        
+        # 重塑回原始形状
+        x = x.transpose(1, 2)  # [batch_size, seq_len, n_head, head_dim]
+        x = x.contiguous()
+        x = x.view(batch_size, self.seq_len, -1)  # [batch_size, seq_len, hidden_dim]
+        
+        # 转换回float32以进行后续计算
+        x = x.to(torch.float32)
+        
+        # 残差连接和层归一化
+        x = x + x  # 残差连接
+        x = self.norm2(x)
+        
+        # 只取第一个时间步的输出
+        x = x[:, 0, :]
+        x = x.contiguous()  # 确保最终输出是连续的
+        
+        # 输出层
+        x = self.output_layer(x)
+        return x.squeeze(-1)
 
 # 训练模型函数
 def train_model(model, train_loader, test_loader, num_epochs=100, learning_rate=0.001, patience=10):
@@ -170,7 +237,6 @@ def train_model(model, train_loader, test_loader, num_epochs=100, learning_rate=
     
     return model
 
-# 评估模型函数
 def evaluate_model(model, test_loader, target_mean, target_std):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
@@ -234,7 +300,7 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
     
     # 创建模型
-    model = RegressionModel(input_dim=4, hidden_dim=128)
+    model = RegressionModel(input_dim=4, hidden_dim=256, n_head=8)
     
     # 训练模型
     trained_model = train_model(model, train_loader, test_loader)
